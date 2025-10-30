@@ -1,0 +1,146 @@
+import argparse
+import os
+
+import pandas as pd
+import torch
+from PIL import Image
+from torchvision.io import read_image
+from torchvision.models import ResNet50_Weights, ViT_H_14_Weights, resnet50, vit_h_14
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        prog="ImageClassification",
+        description="Takes the path of images and generates classification scores",
+    )
+    parser.add_argument("--folder_path", help="path to images", type=str, required=True)
+    parser.add_argument(
+        "--prompts_path", help="path to prompts", type=str, required=True
+    )
+    parser.add_argument(
+        "--save_path",
+        help="path to save results",
+        type=str,
+        required=False,
+        default=None,
+    )
+    parser.add_argument("--device", type=str, required=False, default="cuda:0")
+    parser.add_argument("--topk", type=int, required=False, default=5)
+    parser.add_argument("--batch_size", type=int, required=False, default=250)
+    args = parser.parse_args()
+
+    folder = args.folder_path
+    topk = args.topk
+    device = args.device
+    batch_size = args.batch_size
+    save_path = args.save_path
+    prompts_path = args.prompts_path
+
+    final_images_path = os.path.join(folder, "final_images")   
+
+    subdirectories = [ f.path for f in os.scandir(final_images_path) if f.is_dir() ]
+    for subdir in subdirectories:
+        subdir_last_part = subdir.split("/")[-1]
+
+        my_current_dir = os.path.join(subdir, subdir_last_part)
+        count = 0
+        for path in os.scandir(my_current_dir):
+            if path.is_file() and path.name.endswith(".png"):
+                count += 1
+        if count != 1000:
+            continue
+        
+        print(my_current_dir)
+        # if save_path is None:
+            # name_ = folder.split("/")[-1]
+        save_path = f"{folder}/{subdir_last_part}_classification.csv"
+        save_path = save_path.replace(" ", "_")
+        save_path_results = f"{folder}/{subdir_last_part}_results.txt"
+
+        weights = ResNet50_Weights.DEFAULT
+        model = resnet50(weights=weights)
+        model.to(device)
+        model.eval()
+
+        scores = {}
+        categories = {}
+        indexes = {}
+        for k in range(1, topk + 1):
+            scores[f"top{k}"] = []
+            indexes[f"top{k}"] = []
+            categories[f"top{k}"] = []
+
+        names = os.listdir(my_current_dir)
+        names = [name for name in names if ".png" in name or ".jpg" in name]
+
+        preprocess = weights.transforms()
+
+        images = []
+        for name in names:
+            img = Image.open(os.path.join(my_current_dir, name))
+            batch = preprocess(img)
+            images.append(batch)
+
+        if batch_size == None:
+            batch_size = len(names)
+        if batch_size > len(names):
+            batch_size = len(names)
+        images = torch.stack(images)
+        # Step 4: Use the model and print the predicted category
+        for i in range(((len(names) - 1) // batch_size) + 1):
+            batch = images[i * batch_size : min(len(names), (i + 1) * batch_size)].to(
+                device
+            )
+            with torch.no_grad():
+                prediction = model(batch).softmax(1)
+            probs, class_ids = torch.topk(prediction, topk, dim=1)
+
+            for k in range(1, topk + 1):
+                scores[f"top{k}"].extend(probs[:, k - 1].detach().cpu().numpy())
+                indexes[f"top{k}"].extend(class_ids[:, k - 1].detach().cpu().numpy())
+                categories[f"top{k}"].extend(
+                    [
+                        weights.meta["categories"][idx]
+                        for idx in class_ids[:, k - 1].detach().cpu().numpy()
+                    ]
+                )
+
+        if save_path is not None:
+            df = pd.read_csv(prompts_path)
+            df["case_number"] = df["case_number"].astype("int")
+            case_numbers = []
+            for i, name in enumerate(names):
+                case_number = (
+                    name.split("/")[-1]
+                    .split("_")[0]
+                    .replace(".png", "")
+                    .replace(".jpg", "")
+                )
+                case_numbers.append(int(case_number))
+
+            dict_final = {"case_number": case_numbers}
+
+            for k in range(1, topk + 1):
+                dict_final[f"category_top{k}"] = categories[f"top{k}"]
+                dict_final[f"index_top{k}"] = indexes[f"top{k}"]
+                dict_final[f"scores_top{k}"] = scores[f"top{k}"]
+
+            df_results = pd.DataFrame(dict_final)
+            merged_df = pd.merge(df, df_results)
+            merged_df.to_csv(save_path)
+
+            with open(save_path_results, "w+") as f:
+                for case in list(set(case_numbers)):
+                    case_subset = merged_df[merged_df["case_number"] == case]
+                    all_case_rows = case_subset.count()[0]
+                    f.write(f"Case: {case} \n")
+                    good_pred = 0
+                    for k in range(all_case_rows):
+                        if case_subset["class"].iloc[k].lower() == case_subset["category_top1"].iloc[k].lower():
+                            good_pred += 1
+                    f.write(f"UA: {1 - (good_pred / all_case_rows)} \n")
+
+# python eval-scripts/imageclassify.py --folder_path evaluation_folder/ua/compvis-esd-method_noxattn-lr_1e-05 --prompts_path prompts/imagenette.csv
+# python eval-scripts/imageclassify.py --folder_path evaluation_folder/ua/compvis-cl-mask-method_full-alpha_0.5-epoch_10-lr_1e-05 --prompts_path prompts/imagenette.csv
+# python eval-scripts/imageclassify.py --folder_path evaluation_folder/ua/compvis-rl-mask-method_full-alpha_0.5-epoch_10-lr_1e-05 --prompts_path prompts/imagenette.csv
+# python eval-scripts/imageclassify.py --folder_path evaluation_folder/ua/compvis-ga-mask-method_full-alpha_30.0-epoch_10-lr_1e-05 --prompts_path prompts/imagenette.csv
+# python eval-scripts/imageclassify.py --folder_path evaluation_folder/ua/compvis-forget-me-not --prompts_path prompts/imagenette.csv
